@@ -1,0 +1,98 @@
+name: Build Docker image (weekly security refresh)
+
+# Builds the changedetection.io image and publishes it to this repository's
+# GitHub Container Registry (GHCR). It runs once a week with a clean (no-cache)
+# rebuild so the base image and OS package security updates are actually
+# re-applied, and can also be triggered manually.
+#
+# This is separate from containers.yml (which builds :dev on push to master and
+# :tag/:latest on release) - this workflow exists purely to keep a freshly
+# patched image available on a schedule.
+#
+# Requires nothing beyond the built-in GITHUB_TOKEN (packages: write below).
+
+on:
+  schedule:
+    # Every Monday at 04:00 UTC
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: 'Clean rebuild (ignore cache) to force fresh OS security updates'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-weekly-build
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Record build provenance
+        run: |
+          # COPY'ed into the image by the Dockerfile, read by the server (store.py)
+          echo "${{ github.sha }}" > changedetectionio/source.txt
+          echo "${{ github.ref }}" > changedetectionio/tag.txt
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          image: tonistiigi/binfmt:latest
+          platforms: all
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          install: true
+          version: latest
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=schedule,pattern=weekly-{{date 'YYYYMMDD'}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=changedetection.io
+            org.opencontainers.image.description=Website change detection, monitoring and notifications.
+            org.opencontainers.image.documentation=https://changedetection.io
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # arm/v7 + arm/v8 are intentionally omitted - they are extremely slow
+          # to build (see notes in the Dockerfile). Add them here if you need them.
+          platforms: linux/amd64,linux/arm64
+          # Always re-pull the base image; on the weekly schedule (or when asked
+          # via workflow_dispatch) do a full no-cache rebuild so apt security
+          # updates are re-applied rather than served from a cached layer.
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' || inputs.no_cache }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
